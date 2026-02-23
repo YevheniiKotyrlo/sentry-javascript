@@ -15,7 +15,7 @@ import {
 import type { CloudflareOptions } from './client';
 import { isInstrumented, markAsInstrumented } from './instrument';
 import { init } from './sdk';
-import { buildSpanLinks, getStoredSpanContext, type StoredSpanContext, storeSpanContext } from './utils/traceLinks';
+import { buildSpanLinks, getStoredSpanContext, storeSpanContext } from './utils/traceLinks';
 
 /** Extended DurableObjectState with originalStorage exposed by instrumentContext */
 interface InstrumentedDurableObjectState extends DurableObjectState {
@@ -36,10 +36,7 @@ type MethodWrapperOptions = {
   /**
    * If true, stores the current span context and links to the previous invocation's span.
    * Requires `startNewTrace` to be true. Uses Durable Object storage to persist the link.
-   *
-   * WARNING: Enabling this option causes the wrapped method to always return a Promise,
-   * even if the original method was synchronous. Only use this for methods that are
-   * inherently async (e.g., Cloudflare's `alarm()` handler).
+   * The link is set asynchronously via `span.addLinks()` in a `waitUntil` to avoid blocking.
    *
    * @default false
    */
@@ -160,19 +157,26 @@ export function wrapMethodWithSentry<T extends OriginalMethod>(
             }
           : {};
 
-        const executeSpan = (storedContext?: StoredSpanContext): unknown => {
-          const links = storedContext ? buildSpanLinks(storedContext) : undefined;
-
-          return startSpan({ name: spanName, attributes, links }, span => {
-            // TODO: Remove this once EAP can store span links. We currently only set this attribute so that we
-            // can obtain the previous trace information from the EAP store. Long-term, EAP will handle
-            // span links and then we should remove this again. Also throwing in a TODO(v11), to remind us
-            // to check this at v11 time :)
-            if (storedContext) {
-              const sampledFlag = storedContext.sampled ? '1' : '0';
-              span.setAttribute(
-                'sentry.previous_trace',
-                `${storedContext.traceId}-${storedContext.spanId}-${sampledFlag}`,
+        const executeSpan = (): unknown => {
+          return startSpan({ name: spanName, attributes }, span => {
+            // When linking to previous trace, fetch the stored context and add links asynchronously
+            // This avoids blocking the response while fetching from storage
+            if (linkPreviousTrace && storage) {
+              waitUntil?.(
+                getStoredSpanContext(storage, methodName).then(storedContext => {
+                  if (storedContext) {
+                    span.addLinks(buildSpanLinks(storedContext));
+                    // TODO: Remove this once EAP can store span links. We currently only set this attribute so that we
+                    // can obtain the previous trace information from the EAP store. Long-term, EAP will handle
+                    // span links and then we should remove this again. Also throwing in a TODO(v11), to remind us
+                    // to check this at v11 time :)
+                    const sampledFlag = storedContext.sampled ? '1' : '0';
+                    span.setAttribute(
+                      'sentry.previous_trace',
+                      `${storedContext.traceId}-${storedContext.spanId}-${sampledFlag}`,
+                    );
+                  }
+                }),
               );
             }
 
@@ -212,17 +216,6 @@ export function wrapMethodWithSentry<T extends OriginalMethod>(
             }
           });
         };
-
-        // When linking to previous trace, we need to fetch the stored context first
-        // We chain this with the span execution to avoid making the outer function async
-        if (linkPreviousTrace && storage) {
-          const storedContextPromise = getStoredSpanContext(storage, methodName);
-
-          if (startNewTrace) {
-            return storedContextPromise.then(storedContext => startNewTraceCore(() => executeSpan(storedContext)));
-          }
-          return storedContextPromise.then(storedContext => executeSpan(storedContext));
-        }
 
         if (startNewTrace) {
           return startNewTraceCore(() => executeSpan());

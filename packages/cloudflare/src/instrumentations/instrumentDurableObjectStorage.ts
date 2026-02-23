@@ -79,7 +79,6 @@ export function instrumentDurableObjectStorage(
                 throw e;
               },
             );
-
           },
         );
       };
